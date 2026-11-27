@@ -82,15 +82,19 @@ export function createPickerTool(context: ToolContext): AgentTool {
       // Find available options
       const options = extractPickerOptions(element);
 
+      // LLMs and MCP clients often send numbers even though the schema says
+      // string (e.g. value: 2 for a quantity picker). Normalize once so
+      // matching never calls .toLowerCase() on a non-string.
+      const requested = String(args.value ?? '');
+
       if (options.length > 0) {
-        // Find matching option (case-insensitive)
-        const match = options.find(
-          opt => String(opt.value) === args.value ||
-                 opt.label.toLowerCase() === args.value.toLowerCase()
-        );
+        // Exact value match first, then case-insensitive label match
+        const match =
+          options.find(opt => String(opt.value) === requested) ??
+          options.find(opt => opt.label.toLowerCase() === requested.toLowerCase());
         if (!match) {
           const available = options.map(o => `"${o.label}" (${o.value})`).join(', ');
-          return `❌ Value "${args.value}" not found in picker. Available: ${available}`;
+          return `❌ Value "${requested}" not found in picker. Available: ${available}`;
         }
         try {
           const matchIndex = options.indexOf(match);
