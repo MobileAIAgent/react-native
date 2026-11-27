@@ -3,9 +3,131 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-export function generateSwiftCode(manifestPath: string, appScheme: string): string {
-  const manifests = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+/** Shape of one entry in intent-manifest.json (see generate-intents.ts). */
+export interface IntentManifestEntry {
+  name: string;
+  description?: string;
+  parameters?: Record<
+    string,
+    string | { type?: string; description?: string; [key: string]: any }
+  >;
+}
 
+/** Swift keywords that cannot be used as bare identifiers. */
+const SWIFT_RESERVED = new Set([
+  'associatedtype',
+  'class',
+  'deinit',
+  'enum',
+  'extension',
+  'fileprivate',
+  'func',
+  'import',
+  'init',
+  'inout',
+  'internal',
+  'let',
+  'open',
+  'operator',
+  'private',
+  'precedencegroup',
+  'protocol',
+  'public',
+  'rethrows',
+  'static',
+  'struct',
+  'subscript',
+  'typealias',
+  'var',
+  'break',
+  'case',
+  'catch',
+  'continue',
+  'default',
+  'defer',
+  'do',
+  'else',
+  'fallthrough',
+  'for',
+  'guard',
+  'if',
+  'in',
+  'repeat',
+  'return',
+  'throw',
+  'switch',
+  'where',
+  'while',
+  'Any',
+  'as',
+  'await',
+  'false',
+  'is',
+  'nil',
+  'self',
+  'Self',
+  'super',
+  'throws',
+  'true',
+  'try',
+]);
+
+/**
+ * Escape a JS string so it is safe inside a Swift double-quoted string literal.
+ * Without this, a description such as `Say "hi"` produces uncompilable Swift.
+ */
+export function escapeSwiftString(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\t/g, '\\t');
+}
+
+/**
+ * Turn an arbitrary key into a valid Swift identifier.
+ * Invalid characters become `_`, a leading digit gets a `_` prefix,
+ * and reserved words are wrapped in backticks.
+ */
+export function toSwiftIdentifier(key: string): string {
+  let id = key.replace(/[^A-Za-z0-9_]/g, '_');
+  if (id.length === 0) id = '_';
+  if (/^[0-9]/.test(id)) id = `_${id}`;
+  return SWIFT_RESERVED.has(id) ? `\`${id}\`` : id;
+}
+
+/** `checkout_cart` / `checkout-cart` → `CheckoutCartIntent` */
+export function toIntentStructName(actionName: string): string {
+  const pascal = actionName
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('');
+  const safe = /^[0-9]/.test(pascal) ? `_${pascal}` : pascal;
+  return `${safe || 'Action'}Intent`;
+}
+
+type ManifestParam = NonNullable<IntentManifestEntry['parameters']>[string];
+
+function normalizeParam(
+  key: string,
+  param: ManifestParam
+): { type: string; title: string } {
+  // useAction accepts a bare string as shorthand for a required string param.
+  if (typeof param === 'string') return { type: 'string', title: param || key };
+  return { type: param?.type ?? 'string', title: param?.description || key };
+}
+
+/**
+ * Render Swift AppIntents source for a list of intents.
+ * Pure function — no file system access — so it can be unit tested
+ * and called directly by the Expo config plugin.
+ */
+export function renderSwiftCode(
+  intents: IntentManifestEntry[],
+  appScheme: string
+): string {
   let swiftCode = `import AppIntents
 import UIKit
 
@@ -14,43 +136,41 @@ import UIKit
 
 `;
 
-  for (const intent of manifests) {
-    // Convert snake_case to CamelCaseIntent
-    const structName = intent.name
-      .split('_')
-      .map((w: string) => w.charAt(0).toUpperCase() + w.slice(1))
-      .join('') + 'Intent';
+  for (const intent of intents) {
+    const structName = toIntentStructName(intent.name);
 
     swiftCode += `@available(iOS 16.0, *)\n`;
     swiftCode += `struct ${structName}: AppIntent {\n`;
-    swiftCode += `    static var title: LocalizedStringResource = "${intent.name}"\n`;
-    swiftCode += `    static var description = IntentDescription("${intent.description.replace(/"/g, '\\"')}")\n`;
+    swiftCode += `    static var title: LocalizedStringResource = "${escapeSwiftString(intent.name)}"\n`;
+    swiftCode += `    static var description = IntentDescription("${escapeSwiftString(intent.description)}")\n`;
     swiftCode += `    static var openAppWhenRun: Bool = true\n\n`;
 
     // Parameters
     const params = intent.parameters || {};
-    for (const [key, param] of Object.entries<any>(params)) {
+    for (const [key, raw] of Object.entries(params)) {
+      const param = normalizeParam(key, raw);
       let swiftType = 'String';
       if (param.type === 'number') swiftType = 'Double';
       if (param.type === 'boolean') swiftType = 'Bool';
-      
-      swiftCode += `    @Parameter(title: "${param.description || key}")\n`;
-      swiftCode += `    var ${key}: ${swiftType}?\n\n`;
+
+      swiftCode += `    @Parameter(title: "${escapeSwiftString(param.title)}")\n`;
+      swiftCode += `    var ${toSwiftIdentifier(key)}: ${swiftType}?\n\n`;
     }
 
     // Perform function
     swiftCode += `    @MainActor\n`;
     swiftCode += `    func perform() async throws -> some IntentResult {\n`;
     swiftCode += `        var components = URLComponents()\n`;
-    swiftCode += `        components.scheme = "${appScheme}"\n`;
+    swiftCode += `        components.scheme = "${escapeSwiftString(appScheme)}"\n`;
     swiftCode += `        components.host = "ai-action"\n`;
-    swiftCode += `        components.path = "/${intent.name}"\n`;
-    
+    swiftCode += `        components.path = "/${escapeSwiftString(intent.name)}"\n`;
+
     if (Object.keys(params).length > 0) {
       swiftCode += `        var queryItems: [URLQueryItem] = []\n`;
-      for (const [key, _param] of Object.entries<any>(params)) {
-        swiftCode += `        if let val = ${key} {\n`;
-        swiftCode += `            queryItems.append(URLQueryItem(name: "${key}", value: String(describing: val)))\n`;
+      for (const key of Object.keys(params)) {
+        swiftCode += `        if let val = ${toSwiftIdentifier(key)} {\n`;
+        // The query item keeps the ORIGINAL key so the JS side can match it.
+        swiftCode += `            queryItems.append(URLQueryItem(name: "${escapeSwiftString(key)}", value: String(describing: val)))\n`;
         swiftCode += `        }\n`;
       }
       swiftCode += `        components.queryItems = queryItems\n`;
@@ -65,14 +185,19 @@ import UIKit
   }
 
   // AppShortcuts provider (exposes intents to Siri automatically)
-  if (manifests.length > 0) {
+  if (intents.length > 0) {
     swiftCode += `@available(iOS 16.0, *)\n`;
     swiftCode += `struct MobileAIAppShortcuts: AppShortcutsProvider {\n`;
     swiftCode += `    static var appShortcuts: [AppShortcut] {\n`;
-    for (const intent of manifests) {
-       const structName = intent.name.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join('') + 'Intent';
-       // Generate a basic short phrase mapping
-       swiftCode += `        AppShortcut(intent: ${structName}(), phrases: ["\\\\(.applicationName) ${intent.name.replace(/_/g, ' ')}"])\n`;
+    for (const intent of intents) {
+      const structName = toIntentStructName(intent.name);
+      const spoken = escapeSwiftString(
+        intent.name.replace(/[_-]+/g, ' ').trim()
+      );
+      // Every App Shortcut phrase MUST contain the `\(.applicationName)`
+      // interpolation — Xcode rejects phrases without it. Emit a single
+      // backslash so Swift sees interpolation, not a literal "\(".
+      swiftCode += `        AppShortcut(intent: ${structName}(), phrases: ["\\(.applicationName) ${spoken}"])\n`;
     }
     swiftCode += `    }\n`;
     swiftCode += `}\n`;
@@ -81,11 +206,20 @@ import UIKit
   return swiftCode;
 }
 
+/** Read an intent-manifest.json file and render Swift AppIntents source. */
+export function generateSwiftCode(
+  manifestPath: string,
+  appScheme: string
+): string {
+  const manifests = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  return renderSwiftCode(manifests, appScheme);
+}
+
 async function main() {
   const manifestPath = process.argv[2] || 'intent-manifest.json';
   const appScheme = process.argv[3] || 'mobileai';
   const outPath = process.argv[4] || 'ios/MobileAIPilotIntents.swift';
-  
+
   const absoluteManifest = path.resolve(process.cwd(), manifestPath);
   const absoluteOut = path.resolve(process.cwd(), outPath);
 
@@ -96,7 +230,7 @@ async function main() {
 
   console.log(`Generating Swift code for schema ${appScheme}...`);
   const swiftCode = generateSwiftCode(absoluteManifest, appScheme);
-  
+
   // Ensure dir exists
   const targetDir = path.dirname(absoluteOut);
   if (!fs.existsSync(targetDir)) {
@@ -109,7 +243,7 @@ async function main() {
 
 // Run if called directly
 if (require.main === module) {
-  main().catch(err => {
+  main().catch((err) => {
     console.error(err);
     process.exit(1);
   });
