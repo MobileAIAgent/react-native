@@ -10,6 +10,32 @@
 import { walkFiberTree } from '../core/FiberTreeWalker';
 import type { AgentTool, ToolContext } from './types';
 
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Parse an ISO 8601 string into a Date.
+ *
+ * `new Date('2025-03-25')` is parsed as UTC midnight, which is the previous
+ * calendar day for anyone west of UTC (e.g. Mar 24, 8 PM in New York). Users
+ * mean a local calendar day, so date-only strings are built in local time.
+ * Date-time strings without an offset are already local per the ES spec.
+ */
+export function parseLocalDate(input: string): Date {
+  const match = DATE_ONLY_RE.exec(String(input).trim());
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]) - 1;
+    const day = Number(match[3]);
+    const date = new Date(year, month, day);
+    // Reject overflow like 2025-02-30 (which JS silently turns into Mar 2).
+    if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) {
+      return new Date(NaN);
+    }
+    return date;
+  }
+  return new Date(input);
+}
+
 export function createDatePickerTool(context: ToolContext): AgentTool {
   return {
     name: 'set_date',
@@ -26,7 +52,7 @@ export function createDatePickerTool(context: ToolContext): AgentTool {
       }
 
       // Parse the date string
-      const dateObj = new Date(args.date);
+      const dateObj = parseLocalDate(args.date);
       if (isNaN(dateObj.getTime())) {
         return `❌ Invalid date format: "${args.date}". Use ISO 8601 format (e.g., "2025-03-25" or "2025-03-25T14:30:00").`;
       }
